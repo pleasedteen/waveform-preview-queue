@@ -1,0 +1,22 @@
+{
+  "name": "waveform-preview-queue",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Persistent lease-based segmented waveform preview queue",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "fixtures": "node --disable-warning=ExperimentalWarning dist/src/cli/make-fixtures.js fixtures",
+    "pretest": "npm run build && npm run fixtures",
+    "test": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 --test-reporter=spec \"dist/test/*.test.js\"",
+    "queue": "node --disable-warning=ExperimentalWarning dist/src/cli/queue.js",
+    "submit": "node --disable-warning=ExperimentalWarning dist/src/cli/submit.js",
+    "worker": "node --disable-warning=ExperimentalWarning dist/src/cli/worker.js",
+    "reader": "node --disable-warning=ExperimentalWarning dist/src/cli/reader.js",
+    "smoke": "npm run build && node --disable-warning=ExperimentalWarning dist/src/cli/smoke.js"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.7",
+    "typescript": "5.9.3"
+  }
+}
