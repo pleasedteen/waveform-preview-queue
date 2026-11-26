@@ -159,6 +159,14 @@ export function createServer(service: QueueService, opts: ServerOptions = {}): h
         send(res, 200, result);
         return;
       }
+      if (method === 'POST' && parts.length === 3 && parts[2] === 'takeover-report') {
+        const body = (await readJson(req)) as Record<string, unknown>;
+        if (typeof body.token !== 'string' || body.token.length === 0) {
+          throw new AppError(400, 'bad_request', 'token is required');
+        }
+        send(res, 200, service.reportTakeover(id, body.token));
+        return;
+      }
       if (method === 'POST' && parts.length === 4 && parts[2] === 'leases' && parts[3] === 'renew') {
         const body = (await readJson(req)) as Record<string, unknown>;
         if (typeof body.token !== 'string') throw new AppError(400, 'bad_request', 'token is required');

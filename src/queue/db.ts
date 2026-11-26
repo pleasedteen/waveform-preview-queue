@@ -64,6 +64,43 @@ CREATE TABLE IF NOT EXISTS segments (
 
 CREATE INDEX IF NOT EXISTS idx_segments_recording_idx ON segments(recording_id, idx);
 CREATE INDEX IF NOT EXISTS idx_leases_expiry ON leases(expires_at);
+
+-- One row per reader ack that actually freed a slot for an unfinished
+-- recording. Kept across queue restarts so a confirmation stays traceable;
+-- pruned to the most recent 100 rows.
+CREATE TABLE IF NOT EXISTS handovers (
+  id TEXT PRIMARY KEY,
+  recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+  ack_cursor INTEGER NOT NULL,
+  progress_at_free INTEGER NOT NULL,
+  freed_at INTEGER NOT NULL,
+  -- Denormalised stage times (first non-null wins), maintained together with
+  -- the dispatch rows below inside the same transactions.
+  lease_issued_at INTEGER,
+  reported_at INTEGER,
+  first_segment_at INTEGER,
+  first_segment_idx INTEGER,
+  created_at INTEGER NOT NULL
+);
+
+-- One row per lease issued while a handover is open. A re-dispatch (after a
+-- disconnect, an expiry or a queue restart) appends a new row to the same
+-- handover, so each dispatch's report and first segment stay correlated.
+CREATE TABLE IF NOT EXISTS handover_dispatches (
+  id TEXT PRIMARY KEY,
+  handover_id TEXT NOT NULL REFERENCES handovers(id) ON DELETE CASCADE,
+  recording_id TEXT NOT NULL,
+  worker_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  lease_issued_at INTEGER NOT NULL,
+  reported_at INTEGER,
+  first_segment_at INTEGER,
+  first_segment_idx INTEGER,
+  UNIQUE (recording_id, attempt)
+);
+
+CREATE INDEX IF NOT EXISTS idx_handovers_recording ON handovers(recording_id, freed_at);
+CREATE INDEX IF NOT EXISTS idx_handover_dispatches_handover ON handover_dispatches(handover_id);
 `;
 
 export class Db {

@@ -13,6 +13,14 @@ leases(recording_id PK → recordings, worker_id, token, attempt,
 segments(recording_id, idx, attempt, start_ms, end_ms, sample_count,
          checksum, payload_json, created_at, PK(recording_id, idx))
 
+handovers(id PK, recording_id → recordings, ack_cursor, progress_at_free,
+          freed_at, lease_issued_at, reported_at, first_segment_at,
+          first_segment_idx, created_at)
+
+handover_dispatches(id PK, handover_id → handovers, recording_id, worker_id,
+                    attempt, lease_issued_at, reported_at, first_segment_at,
+                    first_segment_idx, UNIQUE(recording_id, attempt))
+
 meta(key PK, value)
 ```
 
@@ -31,10 +39,11 @@ a paused preview. Both counters are monotonic and only the queue mutates them.
 | Operation | Writes in one `BEGIN IMMEDIATE` |
 | --- | --- |
 | submit | recording row with fresh continuation |
-| claim | replace/create lease, bump `attempts` |
-| commit | segment row + `progress` + `continuation_json` + (`state`,`completed_at`) + lease expiry/fence |
+| claim | replace/create lease, bump `attempts`, dispatch row when an ack-free handover is open |
+| commit | segment row + `progress` + `continuation_json` + (`state`,`completed_at`) + lease expiry/fence + first-segment mark on the dispatch/handover |
 | renew | `expires_at` |
-| ack | `ack_cursor` |
+| ack | `ack_cursor` + handover record (and prune to the most recent 100) when the ack frees a slot |
+| takeover-report | `reported_at` on the dispatch and its handover |
 
 SQLite is opened in WAL mode with a 5 s busy timeout. With `--synchronous FULL`
 (the default) a commit is fsynced before the HTTP response, so an acknowledged
@@ -83,6 +92,35 @@ When the next claim succeeds, `latencyMs = claimedAt - freedAt` is stored in
 `stats.takeovers`. The 500 ms requirement is about the ack path: the ack
 handler wakes parked claimers synchronously before responding, so the next
 commit lands in single-digit milliseconds in practice.
+
+## Ack-free handover tracing
+
+Every ack that actually frees a slot for an unfinished recording also opens a
+`handovers` row (same transaction as the ack cursor update). The row tracks
+four stage times, each null until it happens:
+
+1. `freed_at` — the confirmation that freed the slot (腾位);
+2. `lease_issued_at` — the first lease signed for this free event (签发租约);
+3. `reported_at` — the first worker takeover report (工作进程回报接手);
+4. `first_segment_at` — the resumed run's first segment committed (续跑首段落库).
+
+Each lease signed while the handover is open inserts a `handover_dispatches`
+row keyed by `(recording_id, attempt)`. A worker reports its takeover right
+after claiming (`POST /recordings/:id/takeover-report`), and the queue matches
+the report and the first commit to the dispatch through the lease's attempt
+number. A dispatch with `reported_at` still null means the worker vanished
+before reporting; one with a report but no `first_segment_at` means it got
+stuck afterwards. A re-dispatch (after a disconnect, a lease expiry or a queue
+restart — the lease is gone either way) appends another dispatch to the same
+handover, so every attempt stays correlated to the same confirmation.
+
+Handover rows survive restarts (only leases are dropped on startup) and are
+pruned to the most recent 100; `GET /stats.ackHandovers` exposes them with
+per-stage latencies and a derived `state`
+(`awaiting_lease` / `awaiting_report` / `awaiting_first_segment` / `landed`).
+On startup the in-memory freed-space markers are rebuilt from still-open
+handovers, so a takeover right after a restart is also attributed to the
+original confirmation in `stats.takeovers`.
 
 ## Restart
 

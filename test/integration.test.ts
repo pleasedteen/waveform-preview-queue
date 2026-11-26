@@ -198,10 +198,13 @@ test('queue restart preserves progress, completion and reader acks; work resumes
 
   await h.waitFor(() => h.get('done').state === 'completed', 15_000, 'done to complete');
   await h.waitFor(() => h.get('keep').progress >= 6 && h.get('keep').ackCursor >= 4, 8000, 'keep to make progress');
-  const before = h.get('keep');
-  const doneBefore = h.get('done');
+  // Stop the producer and the reader before snapshotting: afterwards neither
+  // progress nor the ack cursor can still move, so the restart comparison is
+  // deterministic.
   await worker.stop();
   await reader.stop();
+  const before = h.get('keep');
+  const doneBefore = h.get('done');
 
   // Stop the first queue (server + service) but keep the DB file.
   await h.closeServerOnly();

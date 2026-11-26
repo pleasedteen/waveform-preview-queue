@@ -18,7 +18,7 @@
 
 import path from 'node:path';
 import fs from 'node:fs';
-import { startHarness, probesBetween, lastTakeover, type Harness } from '../harness';
+import { startHarness, probesBetween, lastTakeover, latestHandover, type Harness } from '../harness';
 import { loadWav } from '../decoder/wav';
 import { decodeWhole } from '../decoder/mock';
 
@@ -76,6 +76,17 @@ async function scenarioPause(h: Harness): Promise<void> {
     `after ack at ${ackCursor}: progress resumed after ${Date.now() - at} ms ` +
       `(recorded latency ${takeover?.latencyMs ?? 'n/a'} ms)\n`,
   );
+  const ho = latestHandover(h, 'paused-demo');
+  if (ho) {
+    const stage = (label: string, at2: number | null) =>
+      `${label} ${at2 === null ? '—' : `+${at2 - ho.freedAt} ms`}`;
+    process.stdout.write(
+      `handover ${ho.handoverId} [${ho.state}] ack=${ho.ackCursor}: ` +
+        `${stage('freed', ho.freedAt)}, ${stage('lease', ho.leaseIssuedAt)}, ` +
+        `${stage('reported', ho.reportedAt)}, ${stage('first segment', ho.firstSegmentAt)} ` +
+        `(dispatches ${ho.dispatches.length})\n`,
+    );
+  }
   await worker.stop();
 }
 

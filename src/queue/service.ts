@@ -34,9 +34,13 @@ import fs from 'node:fs';
 import { Db } from './db';
 import { AppError, nowMs, randomId } from '../util/common';
 import type {
+  AckHandoverView,
   AckResult,
   ClaimGrant,
   CommitResult,
+  HandoverDispatchRow,
+  HandoverDispatchView,
+  HandoverRow,
   LeaseRow,
   LeaseView,
   ProbeEvent,
@@ -47,6 +51,7 @@ import type {
   RecordingView,
   RenewalEvent,
   TakeoverRecord,
+  TakeoverReportResult,
 } from '../types';
 import {
   type ContinuationState,
@@ -61,6 +66,8 @@ import { loadWav } from '../decoder/wav';
 const MAX_EVENTS = 3000;
 /** Freed-space markers older than this are not reported as takeovers. */
 const MAX_TAKEOVER_TRACK_MS = 120_000;
+/** Only the most recent ack-free handover records are kept. */
+const MAX_HANDOVERS = 100;
 
 export interface QueueServiceOptions {
   dbPath: string;
@@ -159,6 +166,17 @@ export class QueueService {
     // resume automatically.
     const purged = this.db.run('DELETE FROM leases');
     if (purged > 0) this.log(`dropped ${purged} lease(s) left by a previous queue run`);
+
+    // Ack-free handovers whose resumed run never landed a segment are still
+    // open after a restart: the recordings are claimable again and the next
+    // claim attaches a new dispatch to the same persisted handover. Rebuild
+    // the in-memory freed-space markers so the takeover latency stat keeps
+    // attributing those claims to the original confirmation as well.
+    for (const row of this.db.all<{ recording_id: string; freed_at: number }>(
+      'SELECT recording_id, freed_at FROM handovers WHERE first_segment_at IS NULL',
+    )) {
+      this.pendingFree.set(row.recording_id, { since: row.freed_at, reason: 'ack_free' });
+    }
 
     this.sweepTimer = setInterval(() => this.idleSweep(), this.options.idleProbeIntervalMs);
     this.lastSweepAt = nowMs();
@@ -419,10 +437,35 @@ export class QueueService {
       const freedSpace =
         changed && wasPaused && unconfirmed < row.ack_window && row.progress < row.total_segments;
       if (freedSpace) {
-        this.pendingFree.set(id, { since: nowMs(), reason: 'ack_free' });
+        const freedAt = nowMs();
+        this.pendingFree.set(id, { since: freedAt, reason: 'ack_free' });
+        // Durable tracing record for this confirmation: the four stages
+        // (free, lease, takeover report, first resumed segment) start null
+        // and are filled in as the handover progresses — including across
+        // queue restarts and re-dispatches.
+        const handoverId = randomId('ho_');
+        this.db.run(
+          `INSERT INTO handovers
+             (id, recording_id, ack_cursor, progress_at_free, freed_at,
+              lease_issued_at, reported_at, first_segment_at, first_segment_idx, created_at)
+           VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)`,
+          handoverId,
+          id,
+          effective,
+          row.progress,
+          freedAt,
+          freedAt,
+        );
+        // Keep only the most recent records; an open handover is always
+        // among them because frees are chronological.
+        this.db.run(
+          `DELETE FROM handovers
+            WHERE id NOT IN (SELECT id FROM handovers ORDER BY freed_at DESC, rowid DESC LIMIT ?)`,
+          MAX_HANDOVERS,
+        );
         this.emit('ack_free', {
           recordingId: id,
-          detail: { cursor: effective, unconfirmed, ackWindow: row.ack_window },
+          detail: { cursor: effective, unconfirmed, ackWindow: row.ack_window, handoverId },
         });
       } else if (changed) {
         this.emit('ack', { recordingId: id, detail: { cursor: effective } });
@@ -522,10 +565,43 @@ export class QueueService {
           detail: { reason: free.reason, latencyMs: takeover.latencyMs },
         });
       }
+
+      // If a reader confirmation freed this recording and the resumed run has
+      // not landed its first segment yet, this lease is a dispatch of that
+      // handover (a re-dispatch when an earlier dispatch's worker vanished).
+      // The dispatch is correlated by (recording_id, attempt), which is how
+      // the worker's takeover report and its first commit find it again.
+      const openHandover = this.db.get<HandoverRow>(
+        `SELECT * FROM handovers
+          WHERE recording_id = ? AND first_segment_at IS NULL
+          ORDER BY freed_at DESC, rowid DESC LIMIT 1`,
+        candidate.id,
+      );
+      let handoverId: string | null = null;
+      if (openHandover) {
+        handoverId = openHandover.id;
+        this.db.run(
+          `INSERT INTO handover_dispatches
+             (id, handover_id, recording_id, worker_id, attempt,
+              lease_issued_at, reported_at, first_segment_at, first_segment_idx)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+          randomId('hd_'),
+          openHandover.id,
+          candidate.id,
+          workerId,
+          attempt,
+          now,
+        );
+        this.db.run(
+          'UPDATE handovers SET lease_issued_at = COALESCE(lease_issued_at, ?) WHERE id = ?',
+          now,
+          openHandover.id,
+        );
+      }
       this.emit('claim', {
         recordingId: candidate.id,
         workerId,
-        detail: { attempt, expiresAt, progress: candidate.progress, replaced: prev ? (prev.yielded ? 'fenced' : 'expired') : 'none' },
+        detail: { attempt, expiresAt, progress: candidate.progress, replaced: prev ? (prev.yielded ? 'fenced' : 'expired') : 'none', handoverId },
       });
       const row = this.requireRecording(candidate.id);
       return {
@@ -642,6 +718,54 @@ export class QueueService {
       this.scheduleExpiry();
       if (freed) this.pumpWaiters();
     }
+  }
+
+  /**
+   * A worker reports that it took over the recording it just claimed. This is
+   * the explicit "接手回报" that lets /stats distinguish a lease whose worker
+   * vanished before reporting (`reported_at` stays null) from one that
+   * reported and then got stuck before its first segment landed. The report
+   * is correlated to the dispatch by the lease's (recording_id, attempt).
+   * Claims that are not part of an ack-free handover are accepted as no-ops.
+   */
+  reportTakeover(id: string, token: string): TakeoverReportResult {
+    const now = nowMs();
+    return this.db.transaction(() => {
+      this.requireRecording(id);
+      const lease = this.db.get<LeaseRow>('SELECT * FROM leases WHERE recording_id = ?', id);
+      if (!lease || lease.token !== token) {
+        this.counters.lostLeaseRejections++;
+        throw new AppError(409, 'lease_lost', 'lease is no longer held by this worker');
+      }
+      if (lease.yielded === 1) {
+        throw new AppError(409, 'lease_fenced', 'recording is paused at its unconfirmed-segment cap');
+      }
+      if (lease.expires_at <= now) {
+        throw new AppError(409, 'lease_expired', 'lease expired before the takeover report');
+      }
+      const dispatch = this.db.get<HandoverDispatchRow>(
+        'SELECT * FROM handover_dispatches WHERE recording_id = ? AND attempt = ?',
+        id,
+        lease.attempt,
+      );
+      if (!dispatch) return { recorded: false, handoverId: null } satisfies TakeoverReportResult;
+      if (dispatch.reported_at === null) {
+        this.db.run('UPDATE handover_dispatches SET reported_at = ? WHERE id = ?', now, dispatch.id);
+        this.db.run(
+          'UPDATE handovers SET reported_at = COALESCE(reported_at, ?) WHERE id = ?',
+          now,
+          dispatch.handover_id,
+        );
+        this.emit('takeover_report', {
+          recordingId: id,
+          workerId: lease.worker_id,
+          detail: { handoverId: dispatch.handover_id, attempt: lease.attempt },
+        });
+        return { recorded: true, handoverId: dispatch.handover_id } satisfies TakeoverReportResult;
+      }
+      // A retried report is idempotent: the first one stands.
+      return { recorded: false, handoverId: dispatch.handover_id } satisfies TakeoverReportResult;
+    });
   }
 
   commit(id: string, token: string, input: unknown): CommitResult {
@@ -787,6 +911,39 @@ export class QueueService {
           workerId: lease.worker_id,
           detail: { idx: payload.idx, progress: nextProgress, completed },
         });
+
+        // If this lease is a dispatch of an ack-free handover, the first
+        // segment it commits is the resumed run's first segment landing.
+        // Idempotent retries never reach this branch (they returned above).
+        const dispatch = this.db.get<HandoverDispatchRow>(
+          `SELECT d.* FROM handover_dispatches d
+             JOIN handovers h ON h.id = d.handover_id
+            WHERE d.recording_id = ? AND d.attempt = ?
+              AND d.first_segment_at IS NULL AND h.first_segment_at IS NULL`,
+          id,
+          lease.attempt,
+        );
+        if (dispatch) {
+          this.db.run(
+            'UPDATE handover_dispatches SET first_segment_at = ?, first_segment_idx = ? WHERE id = ?',
+            now,
+            payload.idx,
+            dispatch.id,
+          );
+          this.db.run(
+            `UPDATE handovers SET first_segment_at = COALESCE(first_segment_at, ?),
+                                    first_segment_idx = COALESCE(first_segment_idx, ?)
+              WHERE id = ?`,
+            now,
+            payload.idx,
+            dispatch.handover_id,
+          );
+          this.emit('handover_landed', {
+            recordingId: id,
+            workerId: lease.worker_id,
+            detail: { handoverId: dispatch.handover_id, idx: payload.idx, attempt: lease.attempt },
+          });
+        }
         const afterUnconfirmed = nextProgress - row.ack_cursor;
 
         if (completed) {
@@ -959,6 +1116,70 @@ export class QueueService {
 
   // ------------------------------------------------------------------ stats
 
+  /** Tracing views of the most recent ack-free handovers, oldest first. */
+  private handoverViews(): AckHandoverView[] {
+    const rows = this.db.all<HandoverRow>(
+      'SELECT * FROM handovers ORDER BY freed_at ASC, rowid ASC',
+    );
+    if (rows.length === 0) return [];
+    const dispatchRows = this.db.all<HandoverDispatchRow>(
+      'SELECT * FROM handover_dispatches ORDER BY lease_issued_at ASC, rowid ASC',
+    );
+    const byHandover = new Map<string, HandoverDispatchRow[]>();
+    for (const d of dispatchRows) {
+      const list = byHandover.get(d.handover_id);
+      if (list) list.push(d);
+      else byHandover.set(d.handover_id, [d]);
+    }
+    return rows.map((row) => {
+      const dispatches: HandoverDispatchView[] = (byHandover.get(row.id) ?? []).map((d, i, all) => {
+        const phase: HandoverDispatchView['phase'] =
+          d.first_segment_at !== null
+            ? 'landed'
+            : i < all.length - 1
+              ? 'superseded'
+              : d.reported_at !== null
+                ? 'awaiting_first_segment'
+                : 'awaiting_report';
+        return {
+          dispatchId: d.id,
+          workerId: d.worker_id,
+          attempt: d.attempt,
+          leaseIssuedAt: d.lease_issued_at,
+          reportedAt: d.reported_at,
+          firstSegmentAt: d.first_segment_at,
+          firstSegmentIdx: d.first_segment_idx,
+          phase,
+        };
+      });
+      const state: AckHandoverView['state'] =
+        row.first_segment_at !== null
+          ? 'landed'
+          : row.lease_issued_at === null
+            ? 'awaiting_lease'
+            : row.reported_at === null
+              ? 'awaiting_report'
+              : 'awaiting_first_segment';
+      return {
+        handoverId: row.id,
+        recordingId: row.recording_id,
+        ackCursor: row.ack_cursor,
+        progressAtFree: row.progress_at_free,
+        freedAt: row.freed_at,
+        leaseIssuedAt: row.lease_issued_at,
+        reportedAt: row.reported_at,
+        firstSegmentAt: row.first_segment_at,
+        firstSegmentIdx: row.first_segment_idx,
+        leaseLatencyMs: row.lease_issued_at === null ? null : row.lease_issued_at - row.freed_at,
+        reportLatencyMs: row.reported_at === null ? null : row.reported_at - row.freed_at,
+        firstSegmentLatencyMs:
+          row.first_segment_at === null ? null : row.first_segment_at - row.freed_at,
+        state,
+        dispatches,
+      };
+    });
+  }
+
   stats(): QueueStats {
     return {
       startedAt: this.startedAt,
@@ -977,6 +1198,7 @@ export class QueueService {
         events: this.renewalEvents.slice(),
       },
       takeovers: this.takeovers.slice(),
+      ackHandovers: this.handoverViews(),
       idleWorkers: this.waiters.map((w) => w.workerId),
       recordings: this.listRecordings(),
       events: this.events.slice(),

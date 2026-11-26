@@ -15,7 +15,7 @@ import { createServer } from './queue/server';
 import { Worker, type WorkerOptions } from './worker/worker';
 import { Reader, type ReaderOptions } from './reader/reader';
 import { ApiClient } from './api-client';
-import type { ClaimGrant, CommitResult, QueueStats, RecordingView, TakeoverRecord } from './types';
+import type { AckHandoverView, ClaimGrant, CommitResult, QueueStats, RecordingView, TakeoverRecord } from './types';
 import type { SegmentPayload } from './protocol';
 
 export interface HarnessOptions {
@@ -176,6 +176,16 @@ export function lastTakeover(h: Harness, recordingId?: string): TakeoverRecord |
     if (!recordingId || all[i]!.recordingId === recordingId) return all[i];
   }
   return undefined;
+}
+
+/** Ack-free handover records for one recording, oldest first. */
+export function handoversFor(h: Harness, recordingId: string): AckHandoverView[] {
+  return h.stats().ackHandovers.filter((x) => x.recordingId === recordingId);
+}
+
+export function latestHandover(h: Harness, recordingId: string): AckHandoverView | undefined {
+  const all = handoversFor(h, recordingId);
+  return all.length ? all[all.length - 1] : undefined;
 }
 
 /** Count probes (claim scans + renewal checks) inside [from, to). */

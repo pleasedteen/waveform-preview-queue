@@ -155,6 +155,11 @@ export class Worker {
     this.status.current = { recordingId: recording.id, attempt: grant.attempt, nextIdx: recording.progress };
     this.log(`claimed ${recording.id} attempt=${grant.attempt} at segment ${recording.progress}/${recording.totalSegments}`);
 
+    // Report the takeover before doing any work: this is what lets the queue
+    // distinguish "lease issued but the worker vanished" from "the worker
+    // reported and then got stuck before its first segment landed".
+    if (!(await this.reportTakeover(grant))) return;
+
     const wav = this.openWav(recording.path);
     let state: ContinuationState = recording.continuation;
     let nextIdx = recording.progress;
@@ -252,6 +257,33 @@ export class Worker {
       this.stopHeartbeat = null;
       this.currentAbort = null;
       this.status.current = null;
+    }
+  }
+
+  /**
+   * Tell the queue this worker took over the claimed recording. Returns false
+   * when the lease is already lost (the worker goes back to claiming instead
+   * of decoding against a dead lease). Other failures are best effort: the
+   * commit path enforces the lease anyway.
+   */
+  private async reportTakeover(grant: ClaimGrant): Promise<boolean> {
+    const recordingId = grant.recording.id;
+    try {
+      await this.client.post(
+        `/recordings/${encodeURIComponent(recordingId)}/takeover-report`,
+        { token: grant.token, attempt: grant.attempt },
+        { timeoutMs: 10_000 },
+      );
+      return true;
+    } catch (err) {
+      if (err instanceof ApiError && isLeaseError(err.code)) {
+        this.noteLeaseLost(recordingId, err);
+        return false;
+      }
+      if (!this.stopped) {
+        this.log(`takeover report for ${recordingId} failed: ${(err as Error).message}`);
+      }
+      return true;
     }
   }
 

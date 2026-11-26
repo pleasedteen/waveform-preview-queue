@@ -102,6 +102,17 @@ inside the ack request. Because the fenced lease is immediately re-claimable,
 takeover does not wait for lease expiry. The tests assert ack→next commit under
 500 ms while the previous producer is still holding an unexpired lease.
 
+**Every ack-free handover is traceable end to end.** Each reader confirmation
+that actually frees a slot for an unfinished recording opens a durable
+handover record (SQLite, kept across queue restarts, pruned to the most recent
+100). It carries the times of the four stages — slot freed, lease issued,
+worker takeover report, first resumed segment landed — with not-yet-reached
+stages null. Each lease issued for the handover is a separate dispatch with
+its own report/first-segment correlation, so "worker vanished before
+reporting" is distinguishable from "reported, then stuck", and re-dispatches
+(after a disconnect, an expiry or a queue restart) stay attached to the same
+confirmation.
+
 **Idle budget: at most two checks per 4 s.** Idle workers park in event-driven
 long polls and perform no database probes. The service itself runs one sweep
 every `--idle-probe-ms` (default 5000 ms) doing exactly two probes (claim scan +
@@ -118,7 +129,9 @@ run (no worker can prove it still holds one). Recordings, `progress`,
 ## Observing behaviour
 
 `GET /stats` returns counters, probe events with timestamps, renewal events,
-recorded takeovers (`reason`, `freedAt`, `claimedAt`, `latencyMs`), parked
+recorded takeovers (`reason`, `freedAt`, `claimedAt`, `latencyMs`), ack-free
+handover records (`ackHandovers`: the most recent 100 confirmations that freed
+a slot, each with the four stage times and one entry per dispatch), parked
 workers and per-recording views (progress, ack cursor, unconfirmed count,
 paused flag, lease state). `npm run smoke` prints the same numbers as a
 readable timeline:
@@ -130,6 +143,7 @@ all 60 segments match a single-pass decode: true
 
 === 2. reader ack frees space; takeover must be <= 500 ms ===
 after ack at 2: progress resumed after 6 ms (recorded latency 6 ms)
+handover ho_oScBIudmol0H [landed] ack=2: freed +0 ms, lease +1 ms, reported +3 ms, first segment +15 ms (dispatches 1)
 
 === 3. idle budget with every incomplete recording paused ===
 window 1: service checks = 2 (claim scans 1, renewal checks 1) — limit 2
@@ -151,6 +165,7 @@ heartbeats sitting on their own lease are reported separately.
 | `POST /recordings/:id/segments` | `{token, segment}` → commit result (`shouldYield`, `completed`) |
 | `POST /recordings/:id/leases/renew` | `{token}` → new expiry |
 | `POST /recordings/:id/leases/release` | `{token}` → give up the lease |
+| `POST /recordings/:id/takeover-report` | `{token}` → worker reports it took over a claim |
 | `POST /recordings/:id/acks` | `{cursor}` → monotonic read confirmation |
 | `GET /stats`, `GET /health` | observability |
 
@@ -168,6 +183,9 @@ Errors are JSON with `error.code` (`lease_lost`, `lease_expired`,
 - ack-to-takeover latency under 500 ms with a still-valid stalled lease;
 - idle budget across multiple 4 s windows;
 - queue restart preserving progress/completion/acks and resuming work;
+- ack-free handover tracing: disconnect before the takeover report, stall
+  after the report, re-dispatch correlation, queue restart continuing the same
+  confirmation, the 500 ms budget with a parked worker, and the 100-record cap;
 - lease fencing: stale token, out-of-order, duplicate, conflicting commits;
 - reader pause/resume (cap fills, readable while paused) and reconnect without
   duplicates;

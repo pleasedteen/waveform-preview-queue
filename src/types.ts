@@ -159,6 +159,96 @@ export interface TakeoverRecord {
   latencyMs: number;
 }
 
+/** Persisted `handovers` row: one per reader ack that actually freed a slot. */
+export interface HandoverRow {
+  id: string;
+  recording_id: string;
+  /** The reader confirmation that freed the slot. */
+  ack_cursor: number;
+  /** Recording progress at free time = the resume point of the next run. */
+  progress_at_free: number;
+  freed_at: number;
+  lease_issued_at: number | null;
+  reported_at: number | null;
+  first_segment_at: number | null;
+  first_segment_idx: number | null;
+  created_at: number;
+}
+
+/** Persisted `handover_dispatches` row: one per lease issued for a handover. */
+export interface HandoverDispatchRow {
+  id: string;
+  handover_id: string;
+  recording_id: string;
+  worker_id: string;
+  /** Lease attempt; correlates the worker's report and its first commit. */
+  attempt: number;
+  lease_issued_at: number;
+  reported_at: number | null;
+  first_segment_at: number | null;
+  first_segment_idx: number | null;
+}
+
+/**
+ * Stage of a single dispatch. `awaiting_report` = lease issued but the worker
+ * never reported the takeover (e.g. it disconnected); `awaiting_first_segment`
+ * = the worker reported but no segment landed afterwards (stuck mid-run);
+ * `superseded` = a later dispatch was issued for the same handover.
+ */
+export type HandoverDispatchPhase = 'awaiting_report' | 'awaiting_first_segment' | 'landed' | 'superseded';
+
+export interface HandoverDispatchView {
+  dispatchId: string;
+  workerId: string;
+  attempt: number;
+  /** When the queue signed this lease. */
+  leaseIssuedAt: number;
+  /** When the worker process reported the takeover; null = no report received. */
+  reportedAt: number | null;
+  /** When this dispatch's first resumed segment landed; null = none landed. */
+  firstSegmentAt: number | null;
+  firstSegmentIdx: number | null;
+  phase: HandoverDispatchPhase;
+}
+
+/** Overall stage of one ack-free handover (the furthest stage reached). */
+export type HandoverState = 'awaiting_lease' | 'awaiting_report' | 'awaiting_first_segment' | 'landed';
+
+/**
+ * Tracing record for one reader confirmation that actually freed a slot for an
+ * unfinished recording. Stages that have not happened yet are null, so a
+ * handover stuck at any point is distinguishable from a completed one.
+ * Persisted in SQLite, so the same confirmation stays traceable across queue
+ * restarts; re-dispatches append to `dispatches` under the same handoverId.
+ */
+export interface AckHandoverView {
+  handoverId: string;
+  recordingId: string;
+  ackCursor: number;
+  progressAtFree: number;
+  /** 腾位: when the ack dropped the outstanding count below the cap. */
+  freedAt: number;
+  /** 签发租约: first lease issued for this free event (null while unclaimed). */
+  leaseIssuedAt: number | null;
+  /** 工作进程回报接手: first takeover report across dispatches (null if none). */
+  reportedAt: number | null;
+  /** 续跑首段落库: first segment of the resumed run committed (null if none). */
+  firstSegmentAt: number | null;
+  firstSegmentIdx: number | null;
+  leaseLatencyMs: number | null;
+  reportLatencyMs: number | null;
+  firstSegmentLatencyMs: number | null;
+  state: HandoverState;
+  /** Every lease issued for this free event, oldest first. */
+  dispatches: HandoverDispatchView[];
+}
+
+export interface TakeoverReportResult {
+  /** True when the report was attached to an open ack-free handover. */
+  recorded: boolean;
+  handoverId: string | null;
+}
+
 export interface QueueStats {
   startedAt: number;
   uptimeMs: number;
@@ -192,6 +282,11 @@ export interface QueueStats {
     events: RenewalEvent[];
   };
   takeovers: TakeoverRecord[];
+  /**
+   * The most recent 100 reader confirmations that actually freed a slot for
+   * an unfinished recording, oldest first. Persisted across queue restarts.
+   */
+  ackHandovers: AckHandoverView[];
   /** Worker ids currently parked waiting for a claim. */
   idleWorkers: string[];
   recordings: RecordingView[];
